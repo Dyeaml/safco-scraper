@@ -22,7 +22,7 @@ source .venv/bin/activate          # macOS/Linux/Git-Bash
 pip install -r requirements.txt
 
 # 3. (optional) enable the LLM fallback — only needed for irregular pages
-cp .env.example .env               # then put your key in .env
+cp .env.example .env               # then put the LLM API Key in .env
 
 # 4. run
 python main.py                     # uses config.yaml(default max is 200)
