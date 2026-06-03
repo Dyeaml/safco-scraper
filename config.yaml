@@ -1,0 +1,170 @@
+# =============================================================================
+# config.yaml — Safco Dental scraper configuration
+# =============================================================================
+# Everything site-specific or run-tunable lives here, NOT in code. Swapping
+# this file (and nothing else) should be enough to point the system at a
+# different target site or change its runtime behavior.
+#
+# SECRETS DO NOT BELONG HERE. The LLM API key is read from the environment
+# (see `llm.api_key_env`). This file is safe to commit; `.env` is git-ignored.
+# =============================================================================
+
+run:
+  # A human-friendly label; the actual unique run_id is generated at runtime
+  # (timestamp + short uuid) by the orchestrator. This just tags the project.
+  project: "safco-dental"
+  # Hard ceiling so a prototype run can't accidentally crawl forever.
+  # Set to null for "no limit" once you trust it.
+  max_products: 200
+  max_pages: 500
+
+# -----------------------------------------------------------------------------
+# Target site + entry points
+# -----------------------------------------------------------------------------
+site:
+  base_url: "https://www.safcodental.com"
+  # Only URLs on these hosts are ever fetched (SSRF / scope guard).
+  allowed_domains:
+    - "www.safcodental.com"
+    - "safcodental.com"
+  # Seed categories the navigator starts from. These are the two targets given.
+  seed_categories:
+    - "https://www.safcodental.com/catalog/sutures-surgical-products"
+    - "https://www.safcodental.com/catalog/gloves"
+  # Optional: a sitemap can short-circuit traversal by listing product URLs
+  # directly. Left null until confirmed it exists; navigator falls back to
+  # crawling category pages when null.
+  sitemap_url: null
+
+# -----------------------------------------------------------------------------
+# Fetcher — pluggable. "httpx" for server-rendered pages (Safco is SSR);
+# "playwright" reserved for any future JS-rendered category. The agents
+# downstream never change; only this selector does.
+# -----------------------------------------------------------------------------
+fetcher:
+  type: "httpx"            # "httpx" | "playwright"
+  timeout_seconds: 20.0
+  # Sent on every request. A realistic UA is required — the bare default UA
+  # gets the "JavaScript is disabled" shell instead of the rendered HTML.
+  headers:
+    User-Agent: >-
+      Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+      (KHTML, like Gecko) Chrome/124.0 Safari/537.36
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    Accept-Language: "en-US,en;q=0.9"
+  # Playwright-only settings (ignored when type=httpx).
+  playwright:
+    headless: true
+    wait_until: "networkidle"
+    wait_selector: null
+
+# -----------------------------------------------------------------------------
+# Politeness / rate limiting — be a good citizen. Honour robots.txt crawl-delay
+# if present; these are conservative defaults for a prototype.
+# -----------------------------------------------------------------------------
+rate_limit:
+  respect_robots_txt: true
+  max_concurrency: 4        # simultaneous in-flight requests (async semaphore)
+  requests_per_second: 2.0  # global token-bucket ceiling
+  delay_seconds: 0.5        # min delay between requests to the same host
+  jitter_seconds: 0.3       # random extra delay to avoid lockstep bursts
+
+# -----------------------------------------------------------------------------
+# Retries — exponential backoff with jitter on transient errors only.
+# -----------------------------------------------------------------------------
+retry:
+  max_attempts: 4
+  backoff_base_seconds: 1.0   # 1, 2, 4, 8 ... before jitter
+  backoff_factor: 2.0
+  max_backoff_seconds: 30.0
+  # Status codes worth retrying (transient). 404 is NOT here — don't retry it.
+  retry_on_status: [429, 500, 502, 503, 504]
+  # Transport errors (timeouts, connection resets) are always retried.
+
+# -----------------------------------------------------------------------------
+# Page classifier — deterministic rules first, LLM fallback when ambiguous.
+# URL patterns are regex matched against the path.
+# -----------------------------------------------------------------------------
+classifier:
+  url_patterns:
+    product: "^/product/"
+    category: "^/catalog/[^/]+/?$"
+    subcategory: "^/catalog/[^/]+/[^/]+/?$"
+  # DOM signal: presence of a Product JSON-LD block => product page.
+  product_jsonld_type: "Product"
+  # When rules disagree or a page matches nothing, ask the LLM (if enabled).
+  use_llm_fallback: true
+
+# -----------------------------------------------------------------------------
+# Extraction — JSON-LD primary, DOM selectors secondary, LLM fallback last.
+# Selectors are intentionally external so a broken layout is a config fix,
+# not a code change (and can later be auto-repaired by the LLM).
+# -----------------------------------------------------------------------------
+extraction:
+  # Primary: parse these JSON-LD @types from <script type="application/ld+json">
+  jsonld_types:
+    product: "Product"
+    breadcrumb: "BreadcrumbList"
+  # Category nodes to drop from the breadcrumb when building the hierarchy.
+  breadcrumb_drop: ["Home", "Dental Supplies"]
+  # Secondary: CSS selectors for fields JSON-LD does NOT carry.
+  selectors:
+    listing_product_links: "a.product-item-link"
+    pagination_next: "a.action.next"
+    specifications_table: "#product-attribute-specs-table tr"
+    spec_row_key: "th"
+    spec_row_value: "td"
+    variant_options: "div.swatch-option, select#attribute-select option"
+    alternative_products: ".related-products a.product-item-link, .upsell a.product-item-link"
+  # Strip these query params from image URLs to get the original asset.
+  image_strip_query: true
+  # Fallback: when no Product JSON-LD is found on a /product/ page.
+  use_llm_fallback: true
+
+# -----------------------------------------------------------------------------
+# LLM — used SELECTIVELY: page-type tie-breaking, extraction fallback for
+# irregular pages, optional selector-repair suggestions. NOT for routine work.
+# The key is read from the environment, never stored here.
+# -----------------------------------------------------------------------------
+llm:
+  enabled: true
+  provider: "anthropic"
+  model: "claude-3-5-haiku-latest"   # cheap/fast for classify+extract fallback
+  api_key_env: "ANTHROPIC_API_KEY"   # name of the env var, not the value
+  max_tokens: 1500
+  temperature: 0.0                   # deterministic extraction
+  # Safety valve so a buggy run can't rack up cost.
+  max_calls_per_run: 50
+
+# -----------------------------------------------------------------------------
+# Storage — SQLite for the prototype; documented path to Postgres for prod.
+# -----------------------------------------------------------------------------
+storage:
+  backend: "sqlite"                  # "sqlite" | "postgres" (prod)
+  sqlite_path: "data/safco.db"
+  # Upsert by Product.dedup_key; skip write when content_hash is unchanged.
+  upsert: true
+  exports:
+    - format: "json"
+      path: "data/exports/products.json"
+    - format: "csv"
+      path: "data/exports/products.csv"
+
+# -----------------------------------------------------------------------------
+# Checkpointing / resumability — persisted to the DB so a killed run resumes.
+# -----------------------------------------------------------------------------
+checkpoint:
+  enabled: true
+  # Re-enqueue URLs that errored on the previous run.
+  retry_failed_on_resume: true
+
+# -----------------------------------------------------------------------------
+# Logging / observability — structured JSON logs + per-run metrics summary.
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"                      # DEBUG | INFO | WARNING | ERROR
+  format: "json"                     # "json" (prod) | "console" (dev)
+  file: "data/logs/run.log"
+  # Emit a run_summary record (pages, products, dedup hits, failures,
+  # llm_calls, duration) at the end of every run.
+  emit_run_summary: true
